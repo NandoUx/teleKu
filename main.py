@@ -1,32 +1,34 @@
 import os
 import time
 import random
+import threading
 import requests
 from flask import Flask, request
 from dotenv import load_dotenv
 from instagrapi import Client
 from instagrapi.exceptions import LoginRequired
-from datetime import datetime, timedelta
+from datetime import datetime
 
 load_dotenv()
 app = Flask(__name__)
 
+# 🔑 Env
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 IG_USERNAME = os.getenv("IG_USERNAME")
 IG_PASSWORD = os.getenv("IG_PASSWORD")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SESSION_PATH = "ig_session.json"
+UPLOAD_LOG_FILE = "upload_log.txt"
 
-cl = Client()
+# 📌 Limits
+DAILY_LIMIT = 10
+FAIL_LIMIT = 3
 last_upload_time = 0
 upload_count_today = 0
 upload_fail_count = 0
-DAILY_LIMIT = 10
-FAIL_LIMIT = 3
-UPLOAD_LOG_FILE = "upload_log.txt"
 
-
-# 🔒 Save & load IG session
+# 🔐 Login IG
+cl = Client()
 def login_instagram():
     global cl
     try:
@@ -36,79 +38,79 @@ def login_instagram():
         cl.dump_settings(SESSION_PATH)
         print("✅ Instagram login success")
     except LoginRequired:
-        print("⚠️ Login required, retrying...")
+        print("⚠️ Login retry...")
         cl = Client()
         cl.login(IG_USERNAME, IG_PASSWORD)
         cl.dump_settings(SESSION_PATH)
         print("✅ IG login retry success")
 
-# 🔄 Cek berapa kali upload hari ini
+# 📊 Upload log
 def load_upload_count():
     global upload_count_today
     today = datetime.now().date()
     if os.path.exists(UPLOAD_LOG_FILE):
         with open(UPLOAD_LOG_FILE, "r") as f:
             lines = f.readlines()
-            count = 0
-            for line in lines:
-                ts = datetime.fromisoformat(line.strip())
-                if ts.date() == today:
-                    count += 1
+            count = sum(1 for line in lines if datetime.fromisoformat(line.strip()).date() == today)
             upload_count_today = count
-    else:
-        upload_count_today = 0
 
-# 🧠 Simpan log setiap upload
 def log_upload():
     with open(UPLOAD_LOG_FILE, "a") as f:
         f.write(datetime.now().isoformat() + "\n")
 
-# Telegram reply
+# 📩 Send Telegram
 def send_message(chat_id, text):
     requests.post(f"{API_URL}/sendMessage", json={
         "chat_id": chat_id,
         "text": text
     })
 
-# Ambil video + caption dari TikTok
+# 📥 TikTok downloader
 def download_tiktok(url):
     api = f"https://tikwm.com/api/?url={url}"
-    res = requests.get(api).json()
-    if res.get("data"):
-        return res['data']['play'], res['data']['title']
-    return None, None
+    try:
+        res = requests.get(api).json()
+        if res.get("code") == 429:
+            return None, "Rate limit"
+        if res.get("data"):
+            return res['data']['play'], res['data']['title']
+    except Exception as e:
+        print("Download error:", e)
+    return None, "Gagal ambil video"
 
-# Upload video to IG Reels dengan delay, limiter & anti-spam
+# 📤 Upload ke IG
 def upload_to_instagram(video_url, caption, chat_id):
     global last_upload_time, upload_count_today, upload_fail_count
-
-    load_upload_count()
-    if upload_count_today >= DAILY_LIMIT:
-        send_message(chat_id, f"🚫 Sudah mencapai batas harian {DAILY_LIMIT} upload.")
-        return
-
-    if upload_fail_count >= FAIL_LIMIT:
-        send_message(chat_id, f"⚠️ Upload gagal {FAIL_LIMIT}x. Bot auto pause sementara.")
-        return
-
-    now = time.time()
-    delay = random.randint(180, 420)  # 3–7 menit
-    if now - last_upload_time < delay:
-        wait = delay - (now - last_upload_time)
-        send_message(chat_id, f"⏳ Delay aman {int(wait)} detik sebelum upload...")
-        time.sleep(wait)
-
-    video_path = "video.mp4"
-    r = requests.get(video_url)
-    with open(video_path, "wb") as f:
-        f.write(r.content)
-
-    # Tambah sedikit randomizer ke caption
-    caption += f"\n\n🔥 #tiktok {random.randint(1000,9999)}"
-
     try:
+        load_upload_count()
+        if upload_count_today >= DAILY_LIMIT:
+            send_message(chat_id, f"🚫 Batas harian {DAILY_LIMIT} upload tercapai.")
+            return
+
+        if upload_fail_count >= FAIL_LIMIT:
+            send_message(chat_id, "⚠️ Upload gagal berkali-kali. Pause otomatis.")
+            return
+
+        delay = random.randint(180, 420)  # 3–7 menit
+        now = time.time()
+        if now - last_upload_time < delay:
+            wait = delay - (now - last_upload_time)
+            send_message(chat_id, f"⏳ Tunggu {int(wait)} detik untuk upload aman...")
+            time.sleep(wait)
+
+        video_path = "video.mp4"
+        r = requests.get(video_url)
+        with open(video_path, "wb") as f:
+            f.write(r.content)
+
+        hashtags = ["#fyp", "#viral", "#reels", "#tiktok", "#funny", "#trending"]
+        random.shuffle(hashtags)
+        caption += "\n\n🔥 " + " ".join(hashtags[:3])
+
         send_message(chat_id, "🚀 Mengupload ke Instagram...")
         cl.clip_upload(video_path, caption)
+        os.remove(video_path)
+
         last_upload_time = time.time()
         upload_count_today += 1
         upload_fail_count = 0
@@ -119,8 +121,12 @@ def upload_to_instagram(video_url, caption, chat_id):
         send_message(chat_id, f"❌ Gagal upload ke IG: {e}")
         print("Upload error:", e)
 
-@app.route('/', methods=['POST'])
+# 🌐 Webhook handler
+@app.route('/', methods=['GET', 'POST'])
 def webhook():
+    if request.method == 'GET':
+        return {"ok": True, "message": "Bot is running"}
+
     data = request.get_json()
     message = data.get("message", {})
     chat_id = message.get("chat", {}).get("id")
@@ -132,17 +138,18 @@ def webhook():
     if "test ig" in text.lower():
         send_message(chat_id, "🔐 Login ke Instagram sukses, akun siap digunakan!")
     elif "tiktok.com" in text:
-        send_message(chat_id, "📥 Download video dari TikTok...")
+        send_message(chat_id, "📥 Sedang download video TikTok...")
         video_url, caption = download_tiktok(text)
         if video_url:
-            upload_to_instagram(video_url, caption, chat_id)
+            threading.Thread(target=upload_to_instagram, args=(video_url, caption, chat_id)).start()
         else:
-            send_message(chat_id, "❌ Gagal ambil video dari TikTok.")
+            send_message(chat_id, f"❌ {caption}")
     else:
-        send_message(chat_id, "Kirim 'test ig' atau link TikTok.")
+        send_message(chat_id, "Ketik 'test ig' atau kirim link TikTok.")
 
     return {"ok": True}
 
 if __name__ == "__main__":
     login_instagram()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
