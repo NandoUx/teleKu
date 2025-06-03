@@ -4,3 +4,4 @@ python-dotenv
 instagrapi
 Pillow
 beautifulsoup4
+gunicorn
